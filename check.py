@@ -27,7 +27,6 @@ def authenticate(api_key, alias):
     payload = {"api_key": api_key}
     
     try:
-        # 增加鉴权超时时间
         response = requests.post(GRVT_AUTH_ENDPOINT, headers=headers, json=payload, timeout=10)
         response.raise_for_status()
         cookie_value = response.cookies.get("gravity")
@@ -50,6 +49,7 @@ def analyze_fees_last_6_months(auth_headers, sub_account_id, alias):
     end_time_ns = str(int(end_time_dt.timestamp() * 1e9))
     
     print(f"📊 正在拉取 【{alias}】 ({sub_account_id}) 的成交数据...")
+    print(f"📅 分析时间段: {start_time_dt.strftime('%Y-%m-%d')} 至 {end_time_dt.strftime('%Y-%m-%d')}")
     
     cursor = ""
     limit = 1000
@@ -67,29 +67,23 @@ def analyze_fees_last_6_months(auth_headers, sub_account_id, alias):
         if cursor:
             payload["cursor"] = cursor
             
-        # ==========================================
-        # 新增：网络防抖动与自动重试机制
-        # ==========================================
         request_success = False
         data = {}
-        for attempt in range(3):  # 最大重试 3 次
+        for attempt in range(3):  
             try:
-                # 增加了 15 秒的超时限制，防止程序死锁
                 response = requests.post(url, headers=auth_headers, json=payload, timeout=15)
                 response.raise_for_status() 
                 data = response.json()
                 request_success = True
-                break  # 成功拿到数据，跳出重试循环
+                break  
             except requests.exceptions.RequestException as e:
                 print(f"  -> ⚠️ 【{alias}】 第 {page} 页网络异常 (尝试 {attempt+1}/3): {e}")
-                time.sleep(2)  # 等待 2 秒后重试
+                time.sleep(2)  
                 
         if not request_success:
-            print(f"❌ 连续 3 次请求失败！为保证数据严谨，终止 【{alias}】 的拉取，当前统计可能不完整。")
-            break  # 如果重试 3 次依然失败，才真正放弃这一页
+            print(f"❌ 连续 3 次请求失败！终止 【{alias}】 的拉取。")
+            break  
             
-        # ==========================================
-        
         records = data.get("result") or []
         next_cursor = data.get("next", "")
         
@@ -128,28 +122,24 @@ def analyze_fees_last_6_months(auth_headers, sub_account_id, alias):
             
         cursor = next_cursor
         page += 1
-        time.sleep(0.5)  # 成功拉取一页后，轻微休眠 0.5 秒再拉下一页，降低封控概率
+        time.sleep(0.5)  
 
-    # 打印单账户分析结果
     print(f"✅ 【{alias}】 解析完成，共 {total_records} 笔有效成交")
-    
-    if total_records == 0:
-        print("  -> 该账号在此期间没有任何成交记录。")
-    else:
+    if total_records > 0:
         for asset, stats in fees_summary.items():
-            print(f"💰 结算币种: 【{asset}】")
-            print(f"  ├─ 总计手续费 : {round(stats['total_fee'], 4)} {asset}")
-            print(f"  │")
-            print(f"  ├─ 作为 Taker : 共 {stats['taker_count']} 笔")
-            print(f"  │    └── 支出 : {round(stats['taker_fee'], 4)} {asset}")
-            print(f"  │")
-            print(f"  └─ 作为 Maker : 共 {stats['maker_count']} 笔")
-            print(f"       └── 支出 : {round(stats['maker_fee'], 4)} {asset}")
+            print(f"💰 【{asset}】 -> 总费: {round(stats['total_fee'], 4)} | Taker: {round(stats['taker_fee'], 4)} | Maker: {round(stats['maker_fee'], 4)}")
+            
+    # 新增：将该账号的统计结果返回，交给主程序去累加
+    return total_records, fees_summary
 
 if __name__ == "__main__":
     print("="*60)
-    print("🚀 GRVT 多账号对账程序启动 (带防抖动重试机制)")
+    print("🚀 GRVT 多账号对账程序启动 (带全局合计)")
     print("="*60)
+    
+    # 新增：用于存储所有账号合计数据的字典
+    grand_total_records = 0
+    grand_fees_summary = {}
     
     for idx, account in enumerate(ACCOUNTS):
         alias = account.get("alias", f"账号_{idx+1}")
@@ -160,15 +150,45 @@ if __name__ == "__main__":
             print(f"\n⚠️ 提示: 检测到 【{alias}】 未配置真实密钥，已跳过。")
             continue
             
-        print(f"\n" + "*"*50)
+        print(f"\n" + "-"*50)
         auth_headers = authenticate(api_key, alias)
         
         if auth_headers:
-            analyze_fees_last_6_months(auth_headers, sub_account_id, alias)
-        
-        print("*"*50)
+            # 获取单账号返回的统计数据
+            acc_records, acc_summary = analyze_fees_last_6_months(auth_headers, sub_account_id, alias)
+            
+            # 累加到全局总计中
+            grand_total_records += acc_records
+            for asset, stats in acc_summary.items():
+                if asset not in grand_fees_summary:
+                    grand_fees_summary[asset] = {
+                        "maker_fee": 0.0, "taker_fee": 0.0, "total_fee": 0.0, "maker_count": 0, "taker_count": 0
+                    }
+                grand_fees_summary[asset]["total_fee"] += stats["total_fee"]
+                grand_fees_summary[asset]["taker_fee"] += stats["taker_fee"]
+                grand_fees_summary[asset]["maker_fee"] += stats["maker_fee"]
+                grand_fees_summary[asset]["taker_count"] += stats["taker_count"]
+                grand_fees_summary[asset]["maker_count"] += stats["maker_count"]
         
         if idx < len(ACCOUNTS) - 1:
             time.sleep(1.5)
             
-    print("\n🎉 所有账号批量查询及分析完毕！")
+    # ==========================================
+    # 打印最终的大合集 (Grand Total)
+    # ==========================================
+    print("\n" + "="*60)
+    print("🏆 【全部账号全局大汇总】")
+    print("="*60)
+    print(f"总计有效成交笔数: {grand_total_records} 笔\n")
+    
+    if grand_total_records == 0:
+        print("所有账号均无成交记录。")
+    else:
+        for asset, stats in grand_fees_summary.items():
+            print(f"💎 核心资产: 【{asset}】")
+            print(f"  ├─ 🌐 跨账号总手续费: {round(stats['total_fee'], 4)} {asset}")
+            print(f"  │")
+            print(f"  ├─ ⚔️ Taker (吃单)  : 共 {stats['taker_count']} 笔，总支出 {round(stats['taker_fee'], 4)} {asset}")
+            print(f"  │")
+            print(f"  └─ 🛡️ Maker (挂单)  : 共 {stats['maker_count']} 笔，总支出 {round(stats['maker_fee'], 4)} {asset}")
+            print("-" * 60)
